@@ -16,4 +16,4 @@ Now My application runs on top of this Otel and visualised it in a different way
 - now the normalised values have the essense of the response of the JSON response and we could say that it got "translated" into something new. - The Interesting thing is that, these 3 values can be represented as (R, G, B) and this will represent a pixel.
 - Now my planning is that, we could get a batch of logs and get the pixels filled up WRT to a particular service(check the bellow sample image) and then we can have an understanding, if there are any repetition of issues of any particular service or node.
 
-![Sample Output Image](./images/image.png)
+![Sample Output Image](./Images/image.png)
