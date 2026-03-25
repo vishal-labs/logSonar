@@ -52,7 +52,7 @@ def generate_random_traffic():
         except:
             pass # Painter might be offline
 
-        time.sleep(random.uniform(0.1, 0.5)) # Random gap between logs
+        time.sleep(random.uniform(0.01, 0.05)) # Fast emission (~33 logs/sec)
 
 # Start traffic generator in background
 threading.Thread(target=generate_random_traffic, daemon=True).start()
