@@ -36,8 +36,8 @@ class ImageGenerator:
         Args:
             pixel_grid: numpy array of shape (H, W, 3), dtype uint8.
             filename:   Optional custom filename. If None, uses timestamp.
-            scale_factor: Upscale factor so the tiny 50×50 image is viewable.
-                          A factor of 10 produces a 500×500 image.
+            scale_factor: Upscale factor so the tiny 50*50 image is viewable.
+                          A factor of 10 produces a 500*500 image.
 
         Returns:
             Absolute path to the saved image file.

@@ -1,9 +1,5 @@
 """
-test_pipeline.py — Standalone test that validates the full pipeline
-without needing the Flask servers running.
-
-Generates synthetic log data, feeds 2500 pixels (50×50 grid) through the
-pipeline, and verifies that images + analysis reports are created correctly.
+test_pipeline.py — Tests for the v2 service-aware multi-metric pipeline.
 
 Run from the logSonar directory:
     python -m processLogic.test_pipeline
@@ -16,211 +12,279 @@ import random
 import shutil
 import time
 
-# Ensure imports work
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from processLogic.pixel_buffer import PixelBuffer
+from processLogic.pixel_buffer import ServiceAwareBuffer
 from processLogic.image_generator import ImageGenerator
 from processLogic.image_analyzer import ImageAnalyzer
 from processLogic.pipeline import LogSonarPipeline
 
 
+SERVICES = ["toy-service-1", "toy-service-2", "toy-service-3"]
+
+
 # ------------------------------------------------------------------ #
-#  Test helpers                                                       #
+#  Helpers                                                            #
 # ------------------------------------------------------------------ #
 
-def generate_test_color(outcome):
-    """Simulate the painter's get_color logic."""
-    if outcome < 0.1:
-        return (255, 0, 0)       # 500 error → red
-    elif outcome < 0.3:
-        latency = random.uniform(1.0, 1.7)
-        factor = min(max(latency - 0.5, 0), 1.0)
-        r = int(0 + 255 * factor)
-        g = int(255)
-        b = int(0 + 255 * factor)
-        return (r, g, b)         # High latency → warm green/white
+def make_color(status, latency, cpu, memory):
+    """Replicate painter's get_color logic for testing."""
+    # R: error severity
+    if status >= 500:
+        r = 255
+    elif status >= 400:
+        r = 160
     else:
-        latency = random.uniform(0.01, 0.5)
-        return (0, 255, 0)       # Normal → bright green
+        r = 0
+
+    # G: performance (inverted latency)
+    g = int(255 * (1 - min(max(latency, 0), 1.5) / 1.5))
+
+    # B: resource pressure
+    cpu_norm = min(cpu / 100.0, 1.0)
+    mem_norm = min(memory / 1024.0, 1.0)
+    b = int(255 * (cpu_norm * 0.6 + mem_norm * 0.4))
+
+    return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
 
 
-def test_pixel_buffer():
-    """Test that the pixel buffer correctly fires a callback on fill."""
+def generate_service_pixel(service):
+    """Generate a realistic pixel for a specific service personality."""
+    if service == "toy-service-1":  # Stable API
+        status = 500 if random.random() < 0.03 else 200
+        latency = max(0.001, 0.05 + random.gauss(0, 0.02))
+        cpu = random.uniform(5, 20)
+        memory = random.uniform(80, 150)
+    elif service == "toy-service-2":  # Heavy Worker
+        status = 500 if random.random() < 0.08 else 200
+        latency = max(0.001, 0.3 + random.gauss(0, 0.15))
+        cpu = random.uniform(50, 90)
+        memory = random.uniform(300, 600)
+    else:  # Flaky Gateway
+        status = random.choice([502, 503, 504]) if random.random() < 0.15 else 200
+        latency = max(0.001, 0.2 + random.gauss(0, 0.4))
+        cpu = random.uniform(15, 45)
+        memory = random.uniform(120, 250)
+
+    return make_color(status, latency, cpu, memory)
+
+
+# ------------------------------------------------------------------ #
+#  Tests                                                              #
+# ------------------------------------------------------------------ #
+
+def test_service_aware_buffer():
+    """Test that the buffer creates per-service bands and fires callback."""
     print("\n" + "=" * 60)
-    print("TEST 1: PixelBuffer — grid fill callback")
+    print("TEST 1: ServiceAwareBuffer — per-service bands")
     print("=" * 60)
 
     results = []
 
-    def on_full(grid):
-        results.append(grid)
+    def on_full(grid, layout):
+        results.append((grid, layout))
 
-    buf = PixelBuffer(width=10, height=10, on_grid_full=on_full)
+    buf = ServiceAwareBuffer(
+        width=10, rows_per_service=5, services=SERVICES, on_grid_full=on_full
+    )
 
-    # Feed exactly 100 pixels (10×10)
-    for i in range(100):
-        buf.add_pixel((i % 256, (i * 2) % 256, (i * 3) % 256))
+    # Total height = 5*3 + 2 dividers = 17
+    assert buf.total_height == 17, f"Expected height 17, got {buf.total_height}"
+    print(f"✅ Grid dimensions: {buf.total_height}×{buf.width}")
+
+    # Fill all 3 services (10*5 = 50 pixels each)
+    for svc in SERVICES:
+        for _ in range(50):
+            color = generate_service_pixel(svc)
+            buf.add_pixel(svc, color)
 
     assert len(results) == 1, f"Expected 1 callback, got {len(results)}"
-    assert results[0].shape == (10, 10, 3), f"Unexpected shape: {results[0].shape}"
-    print("✅ PixelBuffer callback fired correctly with shape (10, 10, 3)")
+    grid, layout = results[0]
+    assert grid.shape == (17, 10, 3), f"Expected (17,10,3), got {grid.shape}"
+    assert all(svc in layout for svc in SERVICES)
 
-    # After reset, fill pct should be 0
-    assert buf.get_fill_percentage() == 0.0
-    print("✅ Buffer reset after callback")
+    # Verify divider rows are gray
+    assert tuple(grid[5, 0]) == (80, 80, 80), "Divider row 5 should be gray"
+    assert tuple(grid[11, 0]) == (80, 80, 80), "Divider row 11 should be gray"
+    print("✅ Callback fired with correct grid shape and gray dividers")
+    print(f"   Layout: {layout}")
 
 
 def test_image_generator():
-    """Test that the image generator creates a valid PNG."""
+    """Test PNG generation for the taller composite image."""
     print("\n" + "=" * 60)
-    print("TEST 2: ImageGenerator — PNG creation")
+    print("TEST 2: ImageGenerator — composite image")
     print("=" * 60)
 
     import numpy as np
 
-    test_dir = "/tmp/logsonar_test_gen"
+    test_dir = "/tmp/logsonar_v2_test_gen"
     os.makedirs(test_dir, exist_ok=True)
 
     gen = ImageGenerator(output_dir=test_dir)
-
-    # Create a gradient image
     grid = np.zeros((50, 50, 3), dtype=np.uint8)
-    for r in range(50):
-        for c in range(50):
-            grid[r, c] = (r * 5, c * 5, 128)
 
-    path = gen.save(grid, filename="test_gradient.png")
-    assert os.path.exists(path), f"Image not found at {path}"
-    size = os.path.getsize(path)
-    assert size > 0, "Image file is empty"
-    print(f"✅ Generated image: {path} ({size} bytes)")
+    # Simulate 3 service bands with different colors
+    grid[0:16, :] = (0, 200, 30)    # Service 1: mostly green (healthy)
+    grid[16, :] = (80, 80, 80)      # Divider
+    grid[17:33, :] = (100, 150, 180) # Service 2: blueish (resource heavy)
+    grid[33, :] = (80, 80, 80)      # Divider
+    grid[34:50, :] = (200, 100, 50)  # Service 3: reddish (errors)
 
-    # Cleanup
+    path = gen.save(grid, filename="test_composite.png")
+    assert os.path.exists(path)
+    print(f"✅ Composite image saved: {path} ({os.path.getsize(path)} bytes)")
+
     shutil.rmtree(test_dir)
-    print("✅ Cleaned up test directory")
+    print("✅ Cleaned up")
 
 
-def test_image_analyzer():
-    """Test the analyzer on a synthetic image."""
+def test_per_service_analyzer():
+    """Test per-service analysis on a synthetic image."""
     print("\n" + "=" * 60)
-    print("TEST 3: ImageAnalyzer — analysis report")
+    print("TEST 3: ImageAnalyzer — per-service analysis")
     print("=" * 60)
 
     import numpy as np
     from PIL import Image
 
-    test_img_dir = "/tmp/logsonar_test_img"
-    test_analysis_dir = "/tmp/logsonar_test_analysis"
+    test_img_dir = "/tmp/logsonar_v2_test_img"
+    test_out_dir = "/tmp/logsonar_v2_test_analysis"
     os.makedirs(test_img_dir, exist_ok=True)
 
-    # Create an image with deliberate patterns:
-    # - Mostly green (normal)
-    # - Red stripes every 10 rows (periodic errors)
-    # - A few yellow pixels (anomalies)
+    # Build a 50-row image (16+1+16+1+16)
     grid = np.zeros((50, 50, 3), dtype=np.uint8)
-    for r in range(50):
-        for c in range(50):
-            if r % 10 == 0:
-                grid[r, c] = (255, 0, 0)       # Red stripe
-            elif r == 25 and c == 25:
-                grid[r, c] = (255, 255, 0)      # Yellow anomaly
-            else:
-                grid[r, c] = (0, 255, 0)        # Normal green
 
-    img_path = os.path.join(test_img_dir, "test_pattern.png")
+    # Service 1: mostly green (healthy, fast, low resources)
+    for r in range(16):
+        for c in range(50):
+            grid[r, c] = (0, 230, 20)
+    # Inject a few red anomalies
+    grid[5, 25] = (255, 50, 10)
+    grid[10, 30] = (255, 50, 10)
+
+    grid[16, :] = (80, 80, 80)  # Divider
+
+    # Service 2: mixed blue (high resources), with periodic red spikes
+    for r in range(17, 33):
+        for c in range(50):
+            if c % 10 == 0:
+                grid[r, c] = (255, 80, 200)  # Periodic error+resource spike
+            else:
+                grid[r, c] = (30, 170, 180)   # Normal: moderate perf, high resource
+
+    grid[33, :] = (80, 80, 80)  # Divider
+
+    # Service 3: erratic red/orange (many errors, variable)
+    for r in range(34, 50):
+        for c in range(50):
+            if random.random() < 0.15:
+                grid[r, c] = (230, 60, 80)   # Error
+            else:
+                grid[r, c] = (50, 180, 60)    # OK
+
+    img_path = os.path.join(test_img_dir, "test_services.png")
     Image.fromarray(grid).save(img_path)
 
-    analyzer = ImageAnalyzer(output_dir=test_analysis_dir)
-    report = analyzer.analyze(img_path)
+    service_layout = {
+        "toy-service-1": {"start_row": 0, "end_row": 15, "rows": 16},
+        "toy-service-2": {"start_row": 17, "end_row": 32, "rows": 16},
+        "toy-service-3": {"start_row": 34, "end_row": 49, "rows": 16},
+    }
 
-    # Validate report
-    assert "dominant_colors" in report, "Missing dominant_colors"
-    assert "periodicity" in report, "Missing periodicity"
-    assert "anomalies" in report, "Missing anomalies"
-    assert len(report["dominant_colors"]) > 0, "No dominant colors found"
+    analyzer = ImageAnalyzer(output_dir=test_out_dir)
+    report = analyzer.analyze(img_path, service_layout=service_layout)
 
-    print(f"✅ Report generated with {len(report['dominant_colors'])} dominant colors")
-    print(f"   Top color: {report['dominant_colors'][0]['hex']} "
-          f"({report['dominant_colors'][0]['percentage']}%)")
-    print(f"   Anomalies: {report['anomalies']['count']} "
-          f"({report['anomalies']['percentage']}%)")
+    # Validate structure
+    assert "per_service" in report
+    assert "cross_service" in report
+    assert len(report["per_service"]) == 3
 
-    # Check that red channel shows periodicity
-    red_periodic = report["periodicity"].get("red", {})
-    print(f"   Red periodicity: {red_periodic.get('has_periodicity', False)}")
+    for svc in SERVICES:
+        svc_data = report["per_service"][svc]
+        assert "dominant_colors" in svc_data
+        assert "periodicity" in svc_data
+        assert "anomalies" in svc_data
+        assert "channel_stats" in svc_data
+        print(f"  {svc}:")
+        print(f"    Dominant: {svc_data['dominant_colors'][0]['hex'] if svc_data['dominant_colors'] else 'N/A'} "
+              f"({svc_data['dominant_colors'][0].get('interpretation', '') if svc_data['dominant_colors'] else ''})")
+        print(f"    Anomalies: {svc_data['anomalies']['count']}")
+        stats = svc_data["channel_stats"]
+        for metric, vals in stats.items():
+            print(f"    {metric}: mean={vals['mean']}")
 
-    # Check output files
-    assert os.path.exists(report["json_path"]), "JSON report not found"
-    assert os.path.exists(report["composite_path"]), "Composite image not found"
-    print(f"✅ JSON report: {report['json_path']}")
-    print(f"✅ Composite: {report['composite_path']}")
+    cross = report["cross_service"]
+    print(f"\n  Cross-service error ranking: "
+          f"{[m['service'] for m in cross['error_severity_ranking']]}")
 
-    # Cleanup
+    assert os.path.exists(report["json_path"])
+    assert os.path.exists(report["composite_path"])
+    print(f"\n✅ Per-service analysis complete")
+
     shutil.rmtree(test_img_dir)
-    shutil.rmtree(test_analysis_dir)
-    print("✅ Cleaned up test directories")
+    shutil.rmtree(test_out_dir)
+    print("✅ Cleaned up")
 
 
-def test_full_pipeline():
-    """End-to-end test: synthetic logs → pipeline → image + analysis."""
+def test_full_pipeline_v2():
+    """End-to-end: 3 services → service-aware pipeline → image + analysis."""
     print("\n" + "=" * 60)
-    print("TEST 4: Full Pipeline — end-to-end")
+    print("TEST 4: Full Pipeline v2 — end-to-end")
     print("=" * 60)
 
-    gen_dir = "/tmp/logsonar_test_e2e_gen"
-    analysis_dir = "/tmp/logsonar_test_e2e_analysis"
+    gen_dir = "/tmp/logsonar_v2_e2e_gen"
+    analysis_dir = "/tmp/logsonar_v2_e2e_analysis"
 
     pipeline = LogSonarPipeline(
-        width=50, height=50,
+        width=50,
+        rows_per_service=16,
+        services=SERVICES,
         generated_dir=gen_dir,
         analysis_dir=analysis_dir,
     )
 
-    # Feed 2500 pixels (exactly fills one 50×50 grid)
+    # Each service needs 16*50=800 pixels, total 2400
     random.seed(42)
-    for i in range(2500):
-        outcome = random.random()
-        color = generate_test_color(outcome)
-        pipeline.process_pixel(color)
+    for _ in range(800):
+        for svc in SERVICES:
+            color = generate_service_pixel(svc)
+            pipeline.process_pixel(svc, color)
 
-    # Give a moment for any async processing
     time.sleep(0.5)
 
-    # Verify status
     status = pipeline.get_status()
-    print(f"   Pipeline status: {status}")
-    assert status["images_generated"] >= 1, f"Expected ≥1 image, got {status['images_generated']}"
+    print(f"   Status: {json.dumps(status, indent=2)}")
 
-    # Verify files exist
+    assert status["images_generated"] >= 1
+
     gen_files = os.listdir(gen_dir)
     analysis_files = os.listdir(analysis_dir)
-    print(f"   Generated images: {gen_files}")
-    print(f"   Analysis outputs: {analysis_files}")
+    assert len(gen_files) >= 1
+    assert any(f.endswith("_report.json") for f in analysis_files)
 
-    assert len(gen_files) >= 1, "No generated images found"
-    assert any(f.endswith("_report.json") for f in analysis_files), "No JSON report found"
-    assert any(f.endswith("_analysis.png") for f in analysis_files), "No composite image found"
-
-    # Read and validate a JSON report
+    # Read report
     json_files = [f for f in analysis_files if f.endswith("_report.json")]
     with open(os.path.join(analysis_dir, json_files[0])) as f:
         report = json.load(f)
-    print(f"\n   📊 Analysis Report Summary:")
-    print(f"   Image: {report['image_path']}")
-    print(f"   Size: {report['image_size']}")
-    print(f"   Dominant colors: {len(report['dominant_colors'])}")
-    for dc in report["dominant_colors"][:3]:
-        print(f"     {dc['hex']} — {dc['percentage']}%")
-    print(f"   Anomalies: {report['anomalies']['count']} ({report['anomalies']['percentage']}%)")
-    print(f"   Red periodicity: {report['periodicity']['red']['has_periodicity']}")
 
-    print("\n✅ Full pipeline test passed!")
+    print(f"\n   📊 Report Summary:")
+    for svc in SERVICES:
+        svc_data = report["per_service"][svc]
+        top = svc_data["dominant_colors"][0] if svc_data["dominant_colors"] else {}
+        print(f"   {svc}: top={top.get('hex','?')} "
+              f"({top.get('interpretation','?')}), "
+              f"anomalies={svc_data['anomalies']['count']}")
 
-    # Cleanup
+    cross = report["cross_service"]
+    print(f"\n   Error ranking: {[m['service'] for m in cross['error_severity_ranking']]}")
+    print(f"   Resource ranking: {[m['service'] for m in cross['resource_ranking']]}")
+
+    print("\n✅ Full pipeline v2 test passed!")
+
     shutil.rmtree(gen_dir)
     shutil.rmtree(analysis_dir)
-    print("✅ Cleaned up test directories")
+    print("✅ Cleaned up")
 
 
 # ------------------------------------------------------------------ #
@@ -228,14 +292,14 @@ def test_full_pipeline():
 # ------------------------------------------------------------------ #
 
 if __name__ == "__main__":
-    print("🔬 Log Sonar Pipeline Tests")
+    print("🔬 Log Sonar v2 Pipeline Tests")
     print("=" * 60)
 
-    test_pixel_buffer()
+    test_service_aware_buffer()
     test_image_generator()
-    test_image_analyzer()
-    test_full_pipeline()
+    test_per_service_analyzer()
+    test_full_pipeline_v2()
 
     print("\n" + "=" * 60)
-    print("🎉 ALL TESTS PASSED!")
+    print("🎉 ALL v2 TESTS PASSED!")
     print("=" * 60)

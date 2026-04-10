@@ -17,3 +17,17 @@ Now My application runs on top of this Otel and visualised it in a different way
 - Now my planning is that, we could get a batch of logs and get the pixels filled up WRT to a particular service(check the bellow sample image) and then we can have an understanding, if there are any repetition of issues of any particular service or node.
 
 ![Sample Output Image](./Images/image.png)
+
+### The process
+1. Uses KMeans to get the scemantic representation, "healthy, Fast, light.."
+    - Basically means of the cluster will be (R, G, B) values which decide how the overall health of the service looks like 
+2. Uses FFT to find the repetition of patterns 
+    - Say, the service is repeatedly being slowed by some process(say DB connection) every 1 min
+    Our FFT will show that anomaly. 
+3. Finally, we find the find the mean pixel value throught the service, which then is compared with every 
+    other pixel and any pixel with more than 20% deviation, is added to the anamoly list. 
+
+### Plotting
+1. The entire image is split per service
+2. The entire image analysis is done per service(the FFT, Kmeans, Anomoly detection)
+3. The FFT for each service is plotted to analyse any patterns, if not found directly in the image. 
