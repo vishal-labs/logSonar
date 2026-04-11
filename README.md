@@ -31,3 +31,25 @@ Now My application runs on top of this Otel and visualised it in a different way
 1. The entire image is split per service
 2. The entire image analysis is done per service(the FFT, Kmeans, Anomoly detection)
 3. The FFT for each service is plotted to analyse any patterns, if not found directly in the image. 
+
+## How to run the application
+
+To see the system in action, you need to run both the log ingestion server (Painter) and the sample traffic generator side-by-side in separate terminal windows.
+
+### 1. Start the Ingest Server (Painter)
+This server acts as the central pipeline. It listens on port 8000 to accept incoming JSON logs, maps their metrics to an RGB pixel representation, and handles image generation and semantic analysis automatically when the pixel buffer is full.
+
+```bash
+# From the logSonar directory
+python processLogic/painter.py
+```
+
+### 2. Start the Toy Application
+Once the ingest server is running, start the toy traffic generator. This simulates three distinct microservices (with specific profiles like "Reliable API" or "Heavy Worker with errors") and feeds their logs straight to the pipeline via `http://localhost:8000/ingest`.
+
+```bash
+# In a new terminal, from the logSonar directory
+python toy-application/toy_app.py
+```
+
+*Note: As logs buffer and images are generated, check the `generated_images/` and `analysis_output/` folders for the visual observability outputs.*
